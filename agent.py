@@ -1,14 +1,24 @@
 """
-agent.py — Morning Briefing Agent (OpenAI)
--------------------------------------------
-Orchestrates the full briefing pipeline:
+agent.py — Morning Briefing Agent (LangGraph, explicit graph)
+-------------------------------------------------------------
+Demonstrates how to wire LangChain tools, an MCP server, and a SKILL file
+together inside an explicit LangGraph StateGraph — without collapsing each
+tool into its own node.
 
-  1. Loads SKILL.md from the project root and injects it into the system prompt
-  2. Spawns the GNews MCP server as a subprocess (stdio transport)
-  3. Combines MCP tools + custom tools and passes them to the model
-  4. Runs the OpenAI agentic tool-use loop
-  5. Model calls tools: date → headlines → tech news → weather → PDF
-  6. Saves a formatted PDF to ./output/
+Graph topology:
+
+  START → brief_agent ──(tool calls?)──► tools → brief_agent → ...
+                       └─(no tool calls)──► END
+
+Nodes:
+  brief_agent  — LLM (ChatOpenAI) with all tools bound; SKILL.md is injected
+                 as a system prompt so the model writes to the style guide.
+  tools        — ToolNode that dispatches every tool call the LLM emits,
+                 regardless of whether it came from tools.py or the MCP server.
+
+Tools (registered on ToolNode — the LLM decides when to call them):
+  get_current_date, get_weather, generate_pdf_briefing  — tools.py
+  get_top_headlines, search_news                         — GNews MCP server
 
 Usage:
     python agent.py
@@ -20,38 +30,37 @@ Skill:    SKILL.md in the project root (Briefing Style Guide)
 
 import argparse
 import asyncio
-import json
 import os
 import sys
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from tools import get_current_date, get_weather, generate_pdf_briefing
+from tools import generate_pdf_briefing, get_current_date, get_weather
 
 load_dotenv()
 
 MODEL = "gpt-4o"
-
-# ── Load SKILL.md ──────────────────────────────────────────────────────────────
-# The skill is a Briefing Style Guide that the model reads before composing
-# any section content. It actively shapes tone, length, formatting rules, and
-# what to include or skip — this is where the skill earns its place at runtime.
 _SKILL_PATH = os.path.join(os.path.dirname(__file__), "SKILL.md")
+
+
+# ── Skill ──────────────────────────────────────────────────────────────────────
 
 def load_skill() -> str:
     if not os.path.exists(_SKILL_PATH):
-        print("WARNING: SKILL.md not found in project root — style guide not loaded.")
+        print("WARNING: SKILL.md not found — style guide not loaded.")
         return ""
     with open(_SKILL_PATH) as f:
         return f.read()
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
-# SKILL.md is appended here so the model has it in context for the entire run.
-# Every time it writes section content it can refer back to the style rules.
 
 def build_system_prompt(skill: str) -> str:
     base = """You are a morning briefing assistant. Compile a daily briefing by calling tools in this order:
@@ -74,89 +83,51 @@ After the PDF is saved, print a short confirmation message."""
     return base
 
 
-# ── Custom tool definitions ────────────────────────────────────────────────────
-# OpenAI tool format: {"type": "function", "function": {"name", "description", "parameters"}}
-# Note: MCP uses "input_schema" but OpenAI uses "parameters" — both are JSON Schema,
-# so we rename the key when converting MCP tools below.
+# ── Graph ──────────────────────────────────────────────────────────────────────
 
-CUSTOM_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_date",
-            "description": "Return today's date as a human-readable string.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Fetch current weather for a city via Open-Meteo (free, no API key).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city":      {"type": "string",  "description": "City display name"},
-                    "latitude":  {"type": "number",  "description": "Decimal latitude"},
-                    "longitude": {"type": "number",  "description": "Decimal longitude"},
-                },
-                "required": ["city", "latitude", "longitude"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_pdf_briefing",
-            "description": "Generate a formatted A4 PDF morning briefing. Call this last, after all content is ready.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "description": "Briefing title"},
-                    "date":  {"type": "string", "description": "Date string for the header"},
-                    "sections": {
-                        "type": "array",
-                        "description": "Ordered list of content sections",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "heading": {"type": "string"},
-                                "content": {"type": "string"},
-                            },
-                            "required": ["heading", "content"],
-                        },
-                    },
-                },
-                "required": ["title", "date", "sections"],
-            },
-        },
-    },
-]
+def build_graph(llm, all_tools: list, system_prompt: str):
+    """Construct and compile the LangGraph StateGraph.
 
-CUSTOM_TOOL_NAMES = {t["function"]["name"] for t in CUSTOM_TOOLS}
+    Two nodes:
+      brief_agent — LLM with all tools bound; system prompt carries SKILL.md.
+      tools       — ToolNode that executes any tool call the LLM emits
+                    (both tools.py tools and MCP tools are registered here).
+
+    The graph loops brief_agent → tools → brief_agent until the LLM stops
+    emitting tool calls, then routes to END.
+    """
+    llm_with_tools = llm.bind_tools(all_tools)
+    tool_node = ToolNode(all_tools)
+    system_msg = SystemMessage(content=system_prompt)
+
+    # ── Node: brief_agent ──────────────────────────────────────────────────────
+    # The LLM sees the SKILL.md system prompt on every turn and decides which
+    # tools to call next (from tools.py or the MCP server — it doesn't matter).
+    async def brief_agent(state: MessagesState):
+        response = await llm_with_tools.ainvoke([system_msg] + state["messages"])
+        return {"messages": [response]}
+
+    # ── Routing ────────────────────────────────────────────────────────────────
+    def route_after_agent(state: MessagesState) -> str:
+        """Continue to ToolNode if the LLM emitted tool calls, otherwise end."""
+        if state["messages"][-1].tool_calls:
+            return "tools"
+        return END
+
+    # ── Assemble graph ─────────────────────────────────────────────────────────
+    graph = StateGraph(MessagesState)
+
+    graph.add_node("brief_agent", brief_agent)
+    graph.add_node("tools", tool_node)
+
+    graph.add_edge(START, "brief_agent")
+    graph.add_conditional_edges("brief_agent", route_after_agent)
+    graph.add_edge("tools", "brief_agent")
+
+    return graph.compile()
 
 
-# ── Custom tool dispatcher ─────────────────────────────────────────────────────
-
-async def run_custom_tool(name: str, tool_input: dict) -> str:
-    if name == "get_current_date":
-        return get_current_date()
-    elif name == "get_weather":
-        return await get_weather(
-            city=tool_input["city"],
-            latitude=tool_input["latitude"],
-            longitude=tool_input["longitude"],
-        )
-    elif name == "generate_pdf_briefing":
-        return generate_pdf_briefing(
-            title=tool_input["title"],
-            date=tool_input["date"],
-            sections=tool_input["sections"],
-        )
-    return f"Unknown tool: {name}"
-
-
-# ── Main agent loop ────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 async def run_agent(city: str, latitude: float, longitude: float) -> None:
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -167,15 +138,13 @@ async def run_agent(city: str, latitude: float, longitude: float) -> None:
     if not gnews_api_key:
         print("ERROR: GNEWS_API_KEY not set in .env"); sys.exit(1)
 
-    client = AsyncOpenAI(api_key=openai_api_key)
-
-    # ── Load skill ─────────────────────────────────────────────────────────
     skill = load_skill()
     if skill:
         print("Skill loaded: SKILL.md (Briefing Style Guide)")
+
+    llm = ChatOpenAI(model=MODEL, api_key=openai_api_key)
     system_prompt = build_system_prompt(skill)
 
-    # ── Start GNews MCP server ─────────────────────────────────────────────
     print("Starting GNews MCP server...")
     server_params = StdioServerParameters(
         command=sys.executable,
@@ -187,94 +156,27 @@ async def run_agent(city: str, latitude: float, longitude: float) -> None:
         async with ClientSession(read_stream, write_stream) as mcp_session:
             await mcp_session.initialize()
 
-            # ── Convert MCP tools to OpenAI format ────────────────────────
-            # MCP tools use "input_schema"; OpenAI expects "parameters".
-            # Both are plain JSON Schema dicts, so it's just a key rename.
-            mcp_tools_result = await mcp_session.list_tools()
-            mcp_tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description or "",
-                        "parameters": t.inputSchema,
-                    },
-                }
-                for t in mcp_tools_result.tools
-            ]
+            mcp_tools = await load_mcp_tools(mcp_session)
+            all_tools = [get_current_date, get_weather, generate_pdf_briefing, *mcp_tools]
 
-            all_tools = CUSTOM_TOOLS + mcp_tools
-            print(f"Tools available: {[t['function']['name'] for t in all_tools]}")
+            print(f"Tools available: {[t.name for t in all_tools]}")
             print(f"\nGenerating morning briefing for {city}...\n")
             print("─" * 50)
 
-            # ── Initial message ────────────────────────────────────────────
-            messages = [
-                {
-                    "role": "user",
-                    "content": (
+            app = build_graph(llm, all_tools, system_prompt)
+
+            result = await app.ainvoke({
+                "messages": [
+                    HumanMessage(content=(
                         f"Generate my morning briefing. "
                         f"I'm in {city} (lat={latitude}, lon={longitude})."
-                    ),
-                }
-            ]
+                    ))
+                ]
+            })
 
-            # ── Agentic loop ───────────────────────────────────────────────
-            while True:
-                response = await client.chat.completions.create(
-                    model=MODEL,
-                    messages=[{"role": "system", "content": system_prompt}] + messages,
-                    tools=all_tools,
-                    tool_choice="auto",
-                )
-
-                msg = response.choices[0].message
-                finish_reason = response.choices[0].finish_reason
-
-                # Append assistant turn
-                messages.append(msg.model_dump(exclude_unset=False))
-
-                # ── Done ───────────────────────────────────────────────────
-                if finish_reason == "stop":
-                    if msg.content:
-                        print(msg.content)
-                    break
-
-                # ── Tool calls ─────────────────────────────────────────────
-                if finish_reason == "tool_calls" and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        tool_input = json.loads(tc.function.arguments)
-
-                        args_preview = tc.function.arguments
-                        if len(args_preview) > 80:
-                            args_preview = args_preview[:77] + "..."
-                        print(f"  → {tc.function.name}({args_preview})")
-
-                        try:
-                            if tc.function.name in CUSTOM_TOOL_NAMES:
-                                result = await run_custom_tool(tc.function.name, tool_input)
-                            else:
-                                # Pause before each GNews API call to avoid hitting
-                                # the free tier rate limit (1 request/second)
-                                await asyncio.sleep(1.5)
-                                mcp_resp = await mcp_session.call_tool(
-                                    tc.function.name, tool_input
-                                )
-                                result = (
-                                    mcp_resp.content[0].text
-                                    if mcp_resp.content
-                                    else "No result."
-                                )
-                        except Exception as exc:
-                            result = f"Tool error ({tc.function.name}): {exc}"
-                            print(f"     ERROR: {exc}")
-
-                        # OpenAI tool results use role="tool" + tool_call_id
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": str(result),
-                        })
+            final_msg = result["messages"][-1]
+            if hasattr(final_msg, "content") and final_msg.content:
+                print(final_msg.content)
 
             print("─" * 50)
             print("\nCheck the output/ folder for your PDF.")
@@ -283,7 +185,7 @@ async def run_agent(city: str, latitude: float, longitude: float) -> None:
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Morning Briefing Agent")
+    parser = argparse.ArgumentParser(description="Morning Briefing Agent (LangGraph)")
     parser.add_argument("--city", default="Singapore", help="City name")
     parser.add_argument("--lat",  type=float, default=1.29,   help="Latitude")
     parser.add_argument("--lon",  type=float, default=103.85, help="Longitude")

@@ -16,6 +16,27 @@ import os
 import asyncio
 import httpx
 from mcp.server.fastmcp import FastMCP
+import logging
+from dotenv import load_dotenv  # 1. Import the library
+load_dotenv()
+
+# Configure logging for STDIO transport (writes to stderr)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+def get_api_key() -> str:
+    """Get the GNews API key from environment variables"""
+    api_key = os.getenv("GNEWS_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "GNEWS_API_KEY environment variable is required. "
+            "Get your free API key from https://gnews.io/"
+        )
+    return api_key
+
 
 # ── Server setup ──────────────────────────────────────────────────────────────
 mcp = FastMCP("gnews-briefing")
@@ -74,7 +95,11 @@ async def get_top_headlines(
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{GNEWS_BASE_URL}/top-headlines", params=params)
+        for attempt in range(3):
+            await asyncio.sleep(2 ** attempt)
+            resp = await client.get(f"{GNEWS_BASE_URL}/top-headlines", params=params)
+            if resp.status_code != 429:
+                break
         resp.raise_for_status()
         data = resp.json()
 
@@ -102,7 +127,11 @@ async def search_news(query: str, max_results: int = 5) -> str:
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{GNEWS_BASE_URL}/search", params=params)
+        for attempt in range(3):
+            await asyncio.sleep(2 ** attempt)
+            resp = await client.get(f"{GNEWS_BASE_URL}/search", params=params)
+            if resp.status_code != 429:
+                break
         resp.raise_for_status()
         data = resp.json()
 
@@ -110,6 +139,22 @@ async def search_news(query: str, max_results: int = 5) -> str:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+def main():
+    """Run the GNews MCP server"""
+    logger.info("Starting GNews MCP Server...")
+    
+    # Check if API key is available
+    try:
+        get_api_key()
+        logger.info("GNews API key found")
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        print(f"Error: {e}", file=os.sys.stderr)
+        return
+    
+    # Run the server using stdio transport
+    mcp.run(transport="stdio")
+
 
 if __name__ == "__main__":
-    mcp.run()  # stdio transport by default
+    main()

@@ -1,17 +1,20 @@
 """
 tools.py — Custom Agent Tools
 ------------------------------
-Three tools the agent can call directly (not via MCP):
+Three LangChain tools the agent can call:
 
   get_current_date()          → formatted date string
   get_weather(...)            → weather via Open-Meteo (free, no API key)
   generate_pdf_briefing(...)  → creates a styled PDF using reportlab
 """
 
+import asyncio
 import os
 from datetime import datetime
 
 import httpx
+from langchain_core.tools import tool
+from pydantic import BaseModel
 from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -37,6 +40,7 @@ WMO_CODES: dict[int, str] = {
 
 # ── Tool 1: Date ──────────────────────────────────────────────────────────────
 
+@tool
 def get_current_date() -> str:
     """Return today's date as a human-readable string."""
     return datetime.now().strftime("%A, %B %d, %Y")
@@ -44,14 +48,13 @@ def get_current_date() -> str:
 
 # ── Tool 2: Weather (Open-Meteo, free, no key) ────────────────────────────────
 
+@tool
 async def get_weather(city: str, latitude: float, longitude: float) -> str:
-    """
-    Fetch current weather for a city via the Open-Meteo API.
-    Completely free — no API key required.
+    """Fetch current weather for a city via the Open-Meteo API (no API key needed).
 
     Args:
-        city:      Display name (e.g. "Singapore")
-        latitude:  Decimal degrees
+        city: Display name (e.g. "Singapore")
+        latitude: Decimal degrees
         longitude: Decimal degrees
     """
     params = {
@@ -69,7 +72,12 @@ async def get_weather(city: str, latitude: float, longitude: float) -> str:
     }
 
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
+        for attempt in range(3):
+            resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            if resp.status_code < 500:
+                break
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
         resp.raise_for_status()
         data = resp.json()
 
@@ -86,17 +94,19 @@ async def get_weather(city: str, latitude: float, longitude: float) -> str:
 
 # ── Tool 3: PDF generation (reportlab) ────────────────────────────────────────
 
-def generate_pdf_briefing(title: str, date: str, sections: list[dict]) -> str:
-    """
-    Build a styled A4 PDF briefing document.
+class BriefingSection(BaseModel):
+    heading: str
+    content: str
+
+
+@tool
+def generate_pdf_briefing(title: str, date: str, sections: list[BriefingSection]) -> str:
+    """Build a styled A4 PDF briefing document. Call this last, after all content is ready.
 
     Args:
-        title:    Headline displayed at the top (e.g. "Morning Briefing")
-        date:     Date string shown under the title
-        sections: List of {"heading": str, "content": str} dicts
-
-    Returns:
-        Absolute path to the saved PDF.
+        title: Headline displayed at the top (e.g. "Morning Briefing")
+        date: Date string shown under the title
+        sections: Ordered list of sections, each with a heading and content
     """
     os.makedirs("output", exist_ok=True)
     safe_date = date.replace(",", "").replace(" ", "_")
@@ -153,9 +163,9 @@ def generate_pdf_briefing(title: str, date: str, sections: list[dict]) -> str:
     story.append(Spacer(1, 10))
 
     for section in sections:
-        story.append(Paragraph(section.get("heading", ""), heading_style))
+        story.append(Paragraph(section.heading, heading_style))
         # Newlines → <br/> so reportlab renders line breaks inside Paragraph
-        content = section.get("content", "").replace("\n", "<br/>")
+        content = section.content.replace("\n", "<br/>")
         story.append(Paragraph(content, body_style))
         story.append(Spacer(1, 4))
 
