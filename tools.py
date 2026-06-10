@@ -9,14 +9,6 @@ Three tools the agent can call directly (not via MCP):
 """
 
 import os
-
-# ── Skill loader ──────────────────────────────────────────────────────────────
-# If SKILL.md exists in the project root, its contents are injected into the
-# generate_pdf_briefing docstring at import time. This lets any model (OpenAI,
-# Gemini, etc.) read the same reportlab guidance Claude uses internally.
-# To activate: copy SKILL.md into this project's root folder.
-_SKILL_PATH = os.path.join(os.path.dirname(__file__), "SKILL.md")
-_PDF_SKILL = open(_SKILL_PATH).read() if os.path.exists(_SKILL_PATH) else ""
 from datetime import datetime
 
 import httpx
@@ -105,7 +97,7 @@ def generate_pdf_briefing(title: str, date: str, sections: list[dict]) -> str:
 
     Returns:
         Absolute path to the saved PDF.
-    """ + (f"\n\n    --- PDF SKILL REFERENCE ---\n{_PDF_SKILL}" if _PDF_SKILL else "")
+    """
     os.makedirs("output", exist_ok=True)
     safe_date = date.replace(",", "").replace(" ", "_")
     output_path = os.path.abspath(f"output/morning_briefing_{safe_date}.pdf")
